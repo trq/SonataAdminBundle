@@ -18,6 +18,32 @@ use Sonata\AdminBundle\Util\FormViewIterator;
 use Sonata\AdminBundle\Util\FormBuilderIterator;
 use Sonata\AdminBundle\Admin\BaseFieldDescription;
 
+function traverseFieldHierarchy($fieldDescription)
+{
+    if (!$fieldDescription) {
+        return;
+    };
+
+    $parent = $fieldDescription->getAdmin()->getParentFieldDescription();
+    foreach (traverseFieldHierarchy($parent) as $field) {
+        yield $field;
+    };
+
+    yield $fieldDescription;
+}
+
+function traverseFormBuilderDepthFirst($formBuilder)
+{
+    foreach (new FormBuilderIterator($formBuilder) as $base => $builder) {
+        yield [$base, $builder];
+
+        foreach (traverseFormBuilderDepthFirst($builder) as $pair) {
+            list($name, $builder) = $pair;
+            yield $pair;
+        }
+    };
+}
+
 class AdminHelper
 {
     protected $pool;
@@ -40,9 +66,11 @@ class AdminHelper
      */
     public function getChildFormBuilder(FormBuilder $formBuilder, $elementId)
     {
-        foreach (new FormBuilderIterator($formBuilder) as $name => $formBuilder) {
+        foreach (traverseFormBuilderDepthFirst($formBuilder) as $pair) {
+            list($name, $builder) = $pair;
+
             if ($name == $elementId) {
-                return $formBuilder;
+                return $builder;
             }
         }
 
@@ -78,6 +106,29 @@ class AdminHelper
         return $this->pool->getInstance($code);
     }
 
+    protected function getFormFieldDescription(AdminInterface $admin, array $elements)
+    {
+        if (count($elements) == 0) {
+            return null;
+        };
+
+        while ( is_numeric($elementId = array_shift($elements)) ) {};
+
+        $descriptions = $admin->getFormFieldDescriptions();
+        $fieldDescription = $descriptions[$elementId];
+
+        $recursionAdmin = $fieldDescription->getAssociationAdmin();
+
+        if ($fieldDescription && $recursionAdmin) {
+            $newFieldDescription = $this->getFormFieldDescription($recursionAdmin, $elements);
+            if ($newFieldDescription) {
+                return $newFieldDescription;
+            }
+        }
+
+        return $fieldDescription;
+    }
+
     /**
      * Note:
      *   This code is ugly, but there is no better way of doing it.
@@ -102,28 +153,35 @@ class AdminHelper
         $form->bind($admin->getRequest());
 
         // get the field element
-        $childFormBuilder = $this->getChildFormBuilder($formBuilder, $elementId);
+        $childElementPath = split('_', $elementId);
+        $childElementName = array_pop($childElementPath);
 
         // retrieve the FieldDescription
-        $fieldDescription = $admin->getFormFieldDescription($childFormBuilder->getName());
+        $elements = explode('_', substr($elementId, strpos($elementId, '_') + 1));
+        $fieldDescription = $this->getFormFieldDescription($admin, $elements);
 
         try {
             $value = $fieldDescription->getValue($form->getData());
         } catch (NoValueException $e) {
             $value = null;
-        }
+        };
 
         // retrieve the posted data
         $data = $admin->getRequest()->get($formBuilder->getName());
 
-        if (!isset($data[$childFormBuilder->getName()])) {
-            $data[$childFormBuilder->getName()] = array();
-        }
+        $childData =& $data;
+        foreach ($elements as $pathElement) {
+            $childData =& $childData[$pathElement];
+        };
 
         $objectCount = count($value);
-        $postCount   = count($data[$childFormBuilder->getName()]);
+        $postCount   = count($childData);
 
-        $fields = array_keys($fieldDescription->getAssociationAdmin()->getFormFieldDescriptions());
+        $fields = array_keys(
+            $fieldDescription
+            ->getAssociationAdmin()
+            ->getFormFieldDescriptions()
+        );
 
         // for now, not sure how to do that
         $value = array();
@@ -131,15 +189,35 @@ class AdminHelper
             $value[$name] = '';
         }
 
+        $childObject = $form->getData();
+        $hierarchyElements = $elements;
+        foreach (traverseFieldHierarchy($fieldDescription) as $field) {
+            if ($field == $fieldDescription) continue;
+
+            $mapping = $field->getAssociationMapping();
+            $method = sprintf(
+                'get%s',
+                $this->camelize($mapping['fieldName'])
+            );
+
+            $childObject = $childObject->$method();
+
+            $hierarchyElements = array_slice($hierarchyElements, 1);
+            if (is_numeric($hierarchyElements[0])) {
+                $childObject = $childObject[(int)$hierarchyElements[0]];
+                $hierarchyElements = array_slice($hierarchyElements, 1);
+            };
+        };
+
         // add new elements to the subject
         while ($objectCount < $postCount) {
             // append a new instance into the object
-            $this->addNewInstance($form->getData(), $fieldDescription);
+            $this->addNewInstance($childObject, $fieldDescription);
             $objectCount++;
         }
 
-        $this->addNewInstance($form->getData(), $fieldDescription);
-        $data[$childFormBuilder->getName()][] = $value;
+        $this->addNewInstance($childObject, $fieldDescription);
+        $childData[] = $value;
 
         $finalForm = $admin->getFormBuilder()->getForm();
         $finalForm->setData($subject);
@@ -160,20 +238,27 @@ class AdminHelper
      */
     public function addNewInstance($object, FieldDescriptionInterface $fieldDescription)
     {
-        $instance = $fieldDescription->getAssociationAdmin()->getNewInstance();
         $mapping  = $fieldDescription->getAssociationMapping();
-
         $method = sprintf('add%s', $this->camelize($mapping['fieldName']));
 
         if (!method_exists($object, $method)) {
             $method = rtrim($method, 's');
 
             if (!method_exists($object, $method)) {
-                throw new \RuntimeException(sprintf('Please add a method %s in the %s class!', $method, ClassUtils::getClass($object)));
+                throw new \RuntimeException(
+                    sprintf(
+                        'Please add a method %s in the %s class!',
+                        $method,
+                        ClassUtils::getClass($object)
+                    )
+                );
             }
         }
 
-        $object->$method($instance);
+        $object->$method(
+            $fieldDescription->getAssociationAdmin()
+                             ->getNewInstance()
+        );
     }
 
     /**
