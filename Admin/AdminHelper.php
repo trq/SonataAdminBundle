@@ -153,7 +153,7 @@ class AdminHelper
         $form->bind($admin->getRequest());
 
         // get the field element
-        $childElementPath = split('_', $elementId);
+        $childElementPath = explode('_', $elementId);
         $childElementName = array_pop($childElementPath);
 
         // retrieve the FieldDescription
